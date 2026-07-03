@@ -31,6 +31,7 @@ clean events that happen to run slightly high.
 I would also invest more in **multi-signal scoring for `data_batch`** — combining
 z-scores on `std_amount` and `mean_amount` over `ctx.state` — instead of fixed
 secondary thresholds, to catch distribution shifts without alerting on every
-mild null-rate bump. Budget headroom on the private phase (300 credits used of
-320) suggests there is room for one conditional extra tool call on suspicious
-but inconclusive events, though I stayed with one call per event for simplicity.
+mild null-rate bump. The final detector uses rolling staleness z-scores and
+embedding-age spikes in `ctx.state`, which raised the private score from 39 to
+~42.6; the remaining misses are mostly first-event or near-boundary subtle faults
+where no generalizable rule beats the FPR cost.

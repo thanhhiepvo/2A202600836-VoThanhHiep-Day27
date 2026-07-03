@@ -1,17 +1,24 @@
 """
-Pipeline fault detector: baseline thresholds plus stream-aware heuristics
-for subtle faults that sit inside published 3-sigma bounds.
+Pipeline fault detector: baseline thresholds plus stream-relative heuristics
+for subtle faults inside published 3-sigma bounds.
 """
 import math
 
 from api import Verdict
 
 LINEAGE_WINDOW = 15
-LINEAGE_SIGMA_K = 0.8
+LINEAGE_MIN_HISTORY = 3
+LINEAGE_SIGMA_K = 0.5
+BATCH_MIN_HISTORY = 3
+BATCH_WINDOW = 20
+STALENESS_Z_THRESHOLD = 2.7
 NULL_RATE_SUBTLE = 0.0075
 STALENESS_SUBTLE = 6.0
+EMBEDDING_WINDOW = 15
+EMBEDDING_MIN_HISTORY = 5
 EMBEDDING_CENTROID_SUBTLE = 0.028
 EMBEDDING_AGE_SUBTLE = 35.0
+EMBEDDING_AGE_SIGMA_K = 0.6
 
 
 def register(ctx):
@@ -37,13 +44,31 @@ def _pstdev(values):
     return math.sqrt(sum((v - avg) ** 2 for v in values) / len(values))
 
 
-def _lineage_duration_spike(duration_ms, history):
-    if len(history) < 5:
+def _zscore(value, history):
+    if len(history) < BATCH_MIN_HISTORY:
+        return 0.0
+    window = history[-BATCH_WINDOW:]
+    avg = _mean(window)
+    stdev = _pstdev(window) or 1e-9
+    return abs(value - avg) / stdev
+
+
+def _duration_spike(duration_ms, history):
+    if len(history) < LINEAGE_MIN_HISTORY:
         return False
     window = history[-LINEAGE_WINDOW:]
-    mean = _mean(window)
+    avg = _mean(window)
     stdev = _pstdev(window) or 1e-9
-    return duration_ms > mean + LINEAGE_SIGMA_K * stdev
+    return duration_ms > avg + LINEAGE_SIGMA_K * stdev
+
+
+def _embedding_age_spike(age, age_history):
+    if len(age_history) < EMBEDDING_MIN_HISTORY:
+        return False
+    window_a = age_history[-EMBEDDING_WINDOW:]
+    avg = _mean(window_a)
+    stdev = _pstdev(window_a) or 1e-9
+    return age > avg + EMBEDDING_AGE_SIGMA_K * stdev
 
 
 def check_data_batch(payload, ctx):
@@ -57,6 +82,8 @@ def check_data_batch(payload, ctx):
     mean_amount = profile["mean_amount"]
     staleness = profile["staleness_min"]
 
+    stale_hist = ctx.state.setdefault("batch_staleness", [])
+
     alert = (
         row_count < b["row_count_min"]
         or row_count > b["row_count_max"]
@@ -66,7 +93,9 @@ def check_data_batch(payload, ctx):
         or staleness > b["staleness_min_max"]
         or null_rate > NULL_RATE_SUBTLE
         or staleness > STALENESS_SUBTLE
+        or _zscore(staleness, stale_hist) > STALENESS_Z_THRESHOLD
     )
+    stale_hist.append(staleness)
     return Verdict(alert=alert, pillar="checks")
 
 
@@ -99,7 +128,7 @@ def check_lineage_run(payload, ctx):
         duration > b["lineage_duration_ms_max"]
         or downstream == 0
         or "raw.customers" not in upstream
-        or _lineage_duration_spike(duration, history)
+        or _duration_spike(duration, history)
     )
     history.append(duration)
     return Verdict(alert=alert, pillar="lineage")
@@ -122,10 +151,16 @@ def check_embedding_batch(payload, ctx):
     b = ctx.baseline
     centroid = drift["centroid_shift"]
     age = drift["avg_doc_age_days"]
+    cent_hist = ctx.state.setdefault("embedding_centroids", [])
+    age_hist = ctx.state.setdefault("embedding_ages", [])
+
     alert = (
         centroid > b["embedding_centroid_shift_max"]
         or age > b["corpus_avg_doc_age_days_max"]
         or centroid > EMBEDDING_CENTROID_SUBTLE
         or age > EMBEDDING_AGE_SUBTLE
+        or _embedding_age_spike(age, age_hist)
     )
+    cent_hist.append(centroid)
+    age_hist.append(age)
     return Verdict(alert=alert, pillar="ai_infra")
